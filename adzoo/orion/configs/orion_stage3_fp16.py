@@ -295,7 +295,7 @@ model = dict(
             ),
         bbox_coder=dict(
             type='CustomNMSFreeCoder',
-            post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],# 检测到的边界框的中心点的范围。
+            post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
             pc_range=point_cloud_range, # 
             max_num=300,
             voxel_size=voxel_size,
