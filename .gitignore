@@ -1,0 +1,8 @@
+/data/bench2drive/*
+/data/infos/*
+/data/GIFs/
+/data/styleclips/*
+/data/debug/*
+*.tar.gz
+*.pth
+*.env
