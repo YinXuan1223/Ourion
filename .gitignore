@@ -2,3 +2,10 @@
 /assets
 /Accident_Town03_Route101_Weather23
 /adzoo/orion/work_dirs
+/build
+/mmcv
+/mmcv.egg-info
+/ckpts
+/OurStuff_Ourion/GIFs/*
+/OurStuff_Ourion/StyleClips/*
+/OurStuff_Ourion/StyleResults/*
