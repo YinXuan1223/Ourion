@@ -70,13 +70,16 @@ def custom_train_detector(model,
     
     if distributed:
         find_unused_parameters = cfg.get('find_unused_parameters', False)
-        # Sets the `find_unused_parameters` parameter in
-        # torch.nn.parallel.DistributedDataParallel
+        # Convert to half precision before moving to GPU to save memory on 24GB GPUs
+        if cfg.get('half_precision_load', False):
+            model = model.to(torch.bfloat16)
         model = DistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False,
             find_unused_parameters=find_unused_parameters)
+        if cfg.get('static_graph', False):
+            model._set_static_graph()
         if eval_model is not None:
             eval_model = DistributedDataParallel(
                 eval_model.cuda(),
@@ -184,7 +187,9 @@ def custom_train_detector(model,
             runner.register_hook(hook, priority=priority)
 
     if cfg.resume_from:
-        runner.resume(cfg.resume_from)
+        # [StyleDrive] map_location='cpu' so the 18G checkpoint (weights+optimizer)
+        # loads into CPU RAM, not onto the GPU that already holds the model -> avoids OOM.
+        runner.resume(cfg.resume_from, map_location='cpu')
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)

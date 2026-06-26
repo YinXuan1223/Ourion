@@ -201,14 +201,19 @@ class BaseDetector(BaseModule, metaclass=ABCMeta):
                 raise TypeError(
                     f'{loss_name} is not a tensor or list of tensors')
 
-        loss = sum(_value for _key, _value in log_vars.items()
+        loss = sum(torch.nan_to_num(_value) for _key, _value in log_vars.items()
                    if 'loss' in _key)
 
         log_vars['loss'] = loss
         for loss_name, loss_value in log_vars.items():
             # reduce loss when distributed training
             if dist.is_available() and dist.is_initialized():
-                loss_value = loss_value.data.clone()
+                # [StyleDrive] force fp32 so the all_reduce dtype is identical across
+                # ranks. Under bf16 autocast, a loss can be bf16 on one rank but fp32
+                # on another (data-dependent fallback, e.g. empty-sample tensor(0.)),
+                # which makes this collective mismatch and deadlock.
+                # loss_value = loss_value.data.clone()  # original
+                loss_value = loss_value.data.clone().float()
                 dist.all_reduce(loss_value.div_(dist.get_world_size()))
             log_vars[loss_name] = loss_value.item()
 

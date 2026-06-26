@@ -49,6 +49,10 @@ class SigmoidFocalLossFunction(Function):
         ctx.gamma = float(gamma)
         ctx.alpha = float(alpha)
         ctx.reduction = ctx.reduction_dict[reduction]
+        ctx.input_dtype = input.dtype
+        if input.dtype == torch.bfloat16:
+            input = input.float()
+            weight = weight.float()
 
         output = input.new_zeros(input.size())
 
@@ -59,6 +63,8 @@ class SigmoidFocalLossFunction(Function):
         elif ctx.reduction == ctx.reduction_dict['sum']:
             output = output.sum()
         ctx.save_for_backward(input, target, weight)
+        if ctx.input_dtype == torch.bfloat16:
+            output = output.to(torch.bfloat16)
         return output
 
     @staticmethod

@@ -102,6 +102,7 @@ def auto_fp16(apply_to=None, out_fp32=False):
             # get the argument names to be casted
             args_to_cast = args_info.args if apply_to is None else apply_to
             # convert the args that need to be processed
+            _half_dtype = torch.bfloat16
             new_args = []
             # NOTE: default args are not taken into consideration
             if args:
@@ -109,7 +110,7 @@ def auto_fp16(apply_to=None, out_fp32=False):
                 for i, arg_name in enumerate(arg_names):
                     if arg_name in args_to_cast:
                         new_args.append(
-                            cast_tensor_type(args[i], torch.float, torch.half))
+                            cast_tensor_type(args[i], torch.float, _half_dtype))
                     else:
                         new_args.append(args[i])
             # convert the kwargs that need to be processed
@@ -118,18 +119,18 @@ def auto_fp16(apply_to=None, out_fp32=False):
                 for arg_name, arg_value in kwargs.items():
                     if arg_name in args_to_cast:
                         new_kwargs[arg_name] = cast_tensor_type(
-                            arg_value, torch.float, torch.half)
+                            arg_value, torch.float, _half_dtype)
                     else:
                         new_kwargs[arg_name] = arg_value
             # apply converted arguments to the decorated method
             if (digit_version(TORCH_VERSION) >= digit_version('1.6.0')):
-                with autocast(enabled=True):
+                with autocast(enabled=True, dtype=_half_dtype):
                     output = old_func(*new_args, **new_kwargs)
             else:
                 output = old_func(*new_args, **new_kwargs)
             # cast the results back to fp32 if necessary
             if out_fp32:
-                output = cast_tensor_type(output, torch.half, torch.float)
+                output = cast_tensor_type(output, _half_dtype, torch.float)
             return output
 
         return new_func

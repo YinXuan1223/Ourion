@@ -332,7 +332,17 @@ AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
 def add_special_token(special_token_list, tokenizer, model):
     # 给新的token添加索引并用大模型的embeding的平均值来初始化token的embeding
     num_new_tokens = tokenizer.add_tokens(special_token_list, special_tokens = True)
-    model.resize_token_embeddings(len(tokenizer))
+    # [VAE+Style] mean_resizing=False: skip transformers' slow covariance-based multivariate-normal
+    # init for new tokens. It's wasted here -- the new-token embeddings are overwritten with the
+    # embedding mean just below, and again by load_from. mean_resizing=True was stalling startup
+    # ~30min on a CPU-contended box.
+    # model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+    try:
+        model.resize_token_embeddings(len(tokenizer),
+        mean_resizing=False)
+    except TypeError:  # transformers < 4.46 has no mean_resizing kwarg
+        model.resize_token_embeddings(len(tokenizer))
+
     if num_new_tokens > 0:
         input_embeddings = model.get_input_embeddings().weight.data
         output_embeddings = model.get_output_embeddings().weight.data

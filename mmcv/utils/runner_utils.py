@@ -119,8 +119,9 @@ def _init_dist_pytorch(backend, **kwargs):
     rank = int(os.environ['RANK'])
     num_gpus = torch.cuda.device_count()
     torch.cuda.set_device(rank % num_gpus)
-    print("nccl timeout value is set as 3600s!")
-    dist.init_process_group(backend=backend, timeout=timedelta(seconds=3600), **kwargs)
+    _nccl_timeout = int(os.environ.get('NCCL_TIMEOUT_S', 3600))  # [StyleDrive] env-configurable for diagnostics
+    print("nccl timeout value is set as {}s!".format(_nccl_timeout))
+    dist.init_process_group(backend=backend, timeout=timedelta(seconds=_nccl_timeout), **kwargs)
 
 
 def _init_dist_mpi(backend, **kwargs):

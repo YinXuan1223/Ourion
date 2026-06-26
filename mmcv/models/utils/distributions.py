@@ -123,7 +123,12 @@ class PredictModel(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x , h):
-        x, h = self.gru(x, h)
+        # cuDNN's RNN kernels don't support bf16 and reject non-contiguous input
+        # (CUDNN_STATUS_NOT_SUPPORTED). Closed-loop loads the model in bf16 to fit a 24G
+        # card, so run this GRU through PyTorch's native (non-cuDNN) path, which handles
+        # bf16 fine. Tiny GRU -> negligible cost. Diff-decoder path never reaches here.
+        with torch.backends.cudnn.flags(enabled=False):
+            x, h = self.gru(x.contiguous(), h.contiguous())
         x = self.relu(self.linear1(x))
         x = self.relu(self.linear2(x))
         x = self.linear3(x)
