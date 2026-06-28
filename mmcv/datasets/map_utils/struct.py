@@ -78,7 +78,8 @@ class LiDARInstanceLines(object):
         return torch.Tensor([N,fixed_num,2]), in xmin, ymin, xmax, ymax form
             N means the num of instances
         """
-        assert len(self.instance_list) != 0
+        if len(self.instance_list) == 0:
+            return torch.zeros(0, self.fixed_num, 2, dtype=torch.float32)
         instance_points_list = []
         for instance in self.instance_list:
             distances = np.linspace(0, instance.length, self.fixed_num)

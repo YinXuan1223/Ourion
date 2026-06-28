@@ -279,7 +279,16 @@ class B2DOrionDataset(Custom3DDataset):
         input_dict['ego_fut_cmd'] = command
         input_dict['command'] = command_nohot
         input_dict['ego_lcf_feat'] = ego_lcf_feat
-        input_dict['fut_valid_flag'] = (ego_fut_masks==1).all() 
+        input_dict['fut_valid_flag'] = (ego_fut_masks==1).all()
+
+        # [StyleDrive] read per-frame driving style score from PKL.
+        # FORCE_DRIVING_STYLE env var overrides ALL frames to a constant — used at
+        # eval time to sweep style (-1/0/+1) and measure its effect on the trajectory.
+        _force = os.environ.get('FORCE_DRIVING_STYLE', None)
+        if _force is not None:
+            input_dict['driving_style'] = np.float32(float(_force))
+        else:
+            input_dict['driving_style'] = np.float32(info.get('driving_style', 0.0))
 
         return input_dict
 
@@ -291,6 +300,10 @@ class B2DOrionDataset(Custom3DDataset):
 
         ann_info = self.data_infos[index]
         town_name = ann_info['town_name']
+        if town_name not in self.map_infos:
+            empty_labels = torch.zeros(0, dtype=torch.long)
+            empty_bboxes = LiDARInstanceLines([], fixed_num=self.polyline_points_num, patch_size=(self.point_cloud_range[4]-self.point_cloud_range[1], self.point_cloud_range[3]-self.point_cloud_range[0]))
+            return empty_labels, empty_bboxes
         map_info = self.map_infos[town_name]
         lane_points = map_info['lane_points']
         lane_sample_points = map_info['lane_sample_points']
