@@ -19,7 +19,10 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms as T
 from Bench2DriveZoo.team_code.pid_controller import PIDController
-from Bench2DriveZoo.team_code.planner import RoutePlanner
+# Use ORION's local planner: its run_step returns TWO nodes (route[0], route[1]),
+# which tick() unpacks as ((_, curr_command), (near_node, near_command)).
+# Bench2DriveZoo's planner returns a single node -> "cannot unpack RoadOption".
+from Ourion.team_code.planner import RoutePlanner
 from leaderboard.autoagents import autonomous_agent
 from mmcv import Config
 from mmcv.models import build_model 
@@ -29,8 +32,15 @@ from mmcv.parallel.collate import collate as  mm_collate_to_batch_form
 from mmcv.core.bbox import get_box_type
 from pyquaternion import Quaternion
 from scipy.optimize import fsolve
+import re
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
+# [StyleDrive] When STYLE_PER_REP=1, the driving style is chosen from the leaderboard
+# repetition index (parsed from save_name's "_rep{k}_") instead of the FORCE_DRIVING_STYLE
+# env. Run with --repetitions=3 so each route is driven rep0/rep1/rep2 back-to-back =
+# aggressive / neutral / conservative, before moving to the next route.
+STYLE_PER_REP = os.environ.get('STYLE_PER_REP', '0') == '1'
+REP_STYLE_MAP = {0: 1.0, 1: 0.0, 2: -1.0}   # rep0 aggressive / rep1 neutral / rep2 conservative
 
 def get_entry_point():
     return 'OrionAgent'
@@ -54,6 +64,15 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
             self.save_name = path_to_conf_file.split('+')[-1]
         else:
             self.save_name = '_'.join(map(lambda x: '%02d' % x, (now.month, now.day, now.hour, now.minute, now.second)))
+        # [StyleDrive] resolve the driving style for THIS route once (constant for the route).
+        self.style_val = float(os.environ.get('FORCE_DRIVING_STYLE', '0.0'))
+        if STYLE_PER_REP:
+            m = re.search(r'_rep(\d+)_', self.save_name)
+            rep = int(m.group(1)) if m else 0
+            self.style_val = REP_STYLE_MAP.get(rep, 0.0)
+            print('[StyleDrive] STYLE_PER_REP: rep=%d -> driving_style=%+.1f (%s)' % (
+                rep, self.style_val,
+                {1.0: 'aggressive', 0.0: 'neutral', -1.0: 'conservative'}.get(self.style_val, 'custom')), flush=True)
         self.step = -1
         self.wall_start = time.time()
         self.initialized = False
@@ -76,6 +95,14 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
     
             self.model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'), test_cfg=cfg.get('test_cfg'))
             checkpoint = load_checkpoint(self.model, self.ckpt_path, map_location='cpu')
+            # [StyleDrive] cast to half precision before .cuda() so the 7.5B model fits a 24G
+            # card; fp32 weights would OOM on a 3090. dtype is configurable: 'bfloat16' (default,
+            # the diff_style/baseline path) or 'float16' (the authors' validated FP16 path, which
+            # forward() then autocasts to fp16 to match). fp16 has a 10-bit mantissa vs bf16's 7,
+            # so it preserves the generative planner's trajectory precision.
+            if cfg.get('half_precision_load', False):
+                _hp_dtype = getattr(torch, cfg.get('half_precision_dtype', 'bfloat16'))
+                self.model = self.model.to(_hp_dtype)
             self.model.cuda()
             self.model.eval()
             self.inference_only_pipeline = []
@@ -101,14 +128,8 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
             string = self.save_name
             self.save_path = pathlib.Path(os.environ['SAVE_PATH']) / string
             self.save_path.mkdir(parents=True, exist_ok=False)
+            # [StyleDrive] only the front camera is saved (see save()); 10 Hz sampling.
             (self.save_path / 'rgb_front').mkdir()
-            (self.save_path / 'rgb_front_right').mkdir()
-            (self.save_path / 'rgb_front_left').mkdir()
-            (self.save_path / 'rgb_back').mkdir()
-            (self.save_path / 'rgb_back_right').mkdir()
-            (self.save_path / 'rgb_back_left').mkdir()
-            (self.save_path / 'meta').mkdir()
-            (self.save_path / 'bev').mkdir()
    
         # write extrinsics directly
         self.lidar2img = {
@@ -405,6 +426,12 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
                         data[0][i][k] = data[0][i][k].to(self.device)
                     
         custom_wrap_fp16_model(self.model)
+        # [StyleDrive] closed-loop has no PKL, so feed the desired driving style here.
+        # FORCE_DRIVING_STYLE in [-1,1]: -1 conservative / 0 neutral / +1 aggressive.
+        # Nesting matches forward_test's unwrap: data[key][0][0].unsqueeze(0) -> shape (1,).
+        # CFG amplification is read separately by the model from the STYLE_GUIDANCE env.
+        style_val = self.style_val
+        input_data_batch['driving_style'] = [[torch.tensor(style_val, dtype=torch.float32, device=self.device)]]
         output_data_batch = self.model(input_data_batch, return_loss=False)
         out_truck = output_data_batch[0]['pts_bbox']['ego_fut_preds'].cpu().numpy()
         steer_traj, throttle_traj, brake_traj, metadata_traj = self.pidcontroller.control_pid(out_truck, tick_data['speed'], local_command_xy)
@@ -430,26 +457,65 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
         self.pid_metadata['local_command_xy '] = local_command_xy.tolist()
         metric_info = self.get_metric_info()
         self.metric_info[self.step] = metric_info     
-        if SAVE_PATH is not None and self.step % 10 == 0:
+        if SAVE_PATH is not None and self.step % 2 == 0:
             self.save(tick_data)
         self.prev_control = control
+        # [StyleDrive] live view for VNC: write annotated front cam to /dev/shm.
+        # Gated by STYLE_VIEW=1; wrapped so a viz error can never affect driving.
+        if os.environ.get('STYLE_VIEW', '0') == '1':
+            try:
+                self._write_live_view(tick_data, out_truck, control, style_val)
+            except Exception:
+                pass
         return control
 
-    def save(self, tick_data):
-        frame = self.step // 10
-        cvt_c = lambda img: cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # PIL save uses RGB image 
-        Image.fromarray(cvt_c(tick_data['imgs']['CAM_FRONT'])).save(self.save_path / 'rgb_front' / ('%04d.png' % frame))
-        Image.fromarray(cvt_c(tick_data['imgs']['CAM_FRONT_LEFT'])).save(self.save_path / 'rgb_front_left' / ('%04d.png' % frame))
-        Image.fromarray(cvt_c(tick_data['imgs']['CAM_FRONT_RIGHT'])).save(self.save_path / 'rgb_front_right' / ('%04d.png' % frame))
-        Image.fromarray(cvt_c(tick_data['imgs']['CAM_BACK'])).save(self.save_path / 'rgb_back' / ('%04d.png' % frame))
-        Image.fromarray(cvt_c(tick_data['imgs']['CAM_BACK_LEFT'])).save(self.save_path / 'rgb_back_left' / ('%04d.png' % frame))
-        Image.fromarray(cvt_c(tick_data['imgs']['CAM_BACK_RIGHT'])).save(self.save_path / 'rgb_back_right' / ('%04d.png' % frame))
-        Image.fromarray(cvt_c(tick_data['bev'])).save(self.save_path / 'bev' / ('%04d.png' % frame))
-        outfile = open(self.save_path / 'meta' / ('%04d.json' % frame), 'w')
-        json.dump(self.pid_metadata, outfile, indent=4)
-        outfile.close()
+    def _write_live_view(self, tick_data, out_truck, control, style_val):
+        # main image = front camera (tick_data imgs are BGR, as in save())
+        frame = tick_data['imgs']['CAM_FRONT'].copy()
+        H, W = frame.shape[:2]
+        lbl = {1: 'AGGRESSIVE', 0: 'neutral', -1: 'conservative'}.get(int(round(style_val)), 'custom')
+        g = os.environ.get('STYLE_GUIDANCE', '1.0')
+        lines = [
+            'STYLE %+.2f (%s)  CFG g=%s' % (style_val, lbl, g),
+            'speed %.1f m/s  step %d' % (float(tick_data.get('speed', 0.0)), self.step),
+            'thr %.2f  brk %.2f  steer %+.2f' % (control.throttle, control.brake, control.steer),
+        ]
+        for i, t in enumerate(lines):
+            y = 36 + i * 34
+            cv2.putText(frame, t, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 5, cv2.LINE_AA)
+            cv2.putText(frame, t, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA)
+        # small top-down trajectory mini-map (forward = up), bottom-right
+        try:
+            wp = np.asarray(out_truck, dtype=np.float32).reshape(-1, 2)
+            ph, pw = 220, 300
+            panel = np.zeros((ph, pw, 3), np.uint8)
+            scale = 6.0  # px per meter
+            ox, oy = pw // 2, ph - 12  # ego at bottom-center
+            cv2.circle(panel, (ox, oy), 4, (255, 255, 255), -1)
+            prev = (ox, oy)
+            for x_fwd, y_left in wp:
+                px = int(ox - y_left * scale)   # +y(left) -> screen left
+                py = int(oy - x_fwd * scale)    # +x(forward) -> screen up
+                px = max(0, min(pw - 1, px)); py = max(0, min(ph - 1, py))
+                cv2.line(panel, prev, (px, py), (0, 200, 255), 2)
+                cv2.circle(panel, (px, py), 3, (0, 200, 255), -1)
+                prev = (px, py)
+            cv2.putText(panel, 'plan (3s)', (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+            frame[H - ph:H, W - pw:W] = panel
+        except Exception:
+            pass
+        out = os.environ.get('ORION_VIEW_FILE', '/dev/shm/orion_view.jpg')
+        tmp = out + '.tmp.jpg'
+        cv2.imwrite(tmp, frame)            # headless cv2 can encode/write; only GUI is missing
+        os.replace(tmp, out)              # atomic -> viewer never reads a half-written file
 
-        # metric info
+    def save(self, tick_data):
+        # [StyleDrive] called every 2 steps (10 Hz); only the front RGB is written.
+        frame = self.step // 2
+        cvt_c = lambda img: cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # PIL save uses RGB image
+        Image.fromarray(cvt_c(tick_data['imgs']['CAM_FRONT'])).save(self.save_path / 'rgb_front' / ('%04d.png' % frame))
+
+        # metric info (kept: required for the driving-score / ability benchmark)
         outfile = open(self.save_path / 'metric_info.json', 'w')
         json.dump(self.metric_info, outfile, indent=4)
         outfile.close()

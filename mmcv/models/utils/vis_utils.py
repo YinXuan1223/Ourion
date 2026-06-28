@@ -108,7 +108,7 @@ def get_rotz_matrix_array(rz):
 def gen_dx_bx(xbound, ybound, zbound, **kwargs):
     dx = np.array([row[2] for row in [xbound, ybound, zbound]])
     bx = np.array([row[0] for row in [xbound, ybound, zbound]])
-    nx = np.array([(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]], dtype=np.long)
+    nx = np.array([(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]], dtype=np.int64)
 
     return dx, bx, nx
 
@@ -824,7 +824,7 @@ def gen_dx_bx_array(xbound, ybound, zbound, **kwargs):
     dx = np.array([row[2] for row in [xbound, ybound, zbound]])
     bx = np.array([row[0] for row in [xbound, ybound, zbound]])
     nx = np.array(
-        [(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]], dtype=np.long
+        [(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]], dtype=np.int64
     )
 
     return dx, bx, nx

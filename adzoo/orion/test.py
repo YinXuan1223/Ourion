@@ -198,8 +198,13 @@ def main():
         # segmentation dataset has `PALETTE` attribute
         model.PALETTE = dataset.PALETTE
 
+    # [StyleDrive] match training: load weights in bf16 so the model fits on 24GB GPUs
+    # (without this the fp32 model ~36G OOMs at model.cuda()). Same as mmdet_train.py.
+    if cfg.get('half_precision_load', False):
+        model = model.to(torch.bfloat16)
+
     if not distributed:
-        model = DataParallel(model, device_ids=[0])
+        model = DataParallel(model.cuda(), device_ids=[torch.cuda.current_device()])
         outputs = single_gpu_test(model, data_loader)
     else:
         model = DistributedDataParallel(
@@ -215,6 +220,25 @@ def main():
     if rank == 0:
         if args.out:
             print(f'\nwriting results to {args.out}')
+            # [StyleDrive] the original --out never actually dumped anything. Dump a
+            # slim per-frame record (predicted ego trajectory + planning metrics) so
+            # we can compute planning metrics offline and run the style-sweep analysis
+            # without the detection-mAP path (which crashes on bf16 .numpy()).
+            import pickle as _pickle
+            _slim = []
+            for _res in outputs['bbox_results']:
+                _pts = _res.get('pts_bbox', {}) if isinstance(_res, dict) else {}
+                _ego = _pts.get('ego_fut_preds', None)
+                _cmd = _pts.get('ego_fut_cmd', None)
+                _slim.append(dict(
+                    ego_fut_preds=(_ego.float().cpu() if hasattr(_ego, 'float') else _ego),
+                    ego_fut_cmd=(_cmd.cpu() if hasattr(_cmd, 'cpu') else _cmd),
+                    fut_valid_flag=_pts.get('fut_valid_flag', None),
+                    metric_results=_res.get('metric_results', None) if isinstance(_res, dict) else None,
+                ))
+            with open(args.out, 'wb') as _f:
+                _pickle.dump(_slim, _f)
+            print(f'wrote {len(_slim)} slim records to {args.out}')
         kwargs = {} if args.eval_options is None else args.eval_options
         kwargs['jsonfile_prefix'] = osp.join('test', args.config.split(
             '/')[-1].split('.')[-2], time.ctime().replace(' ', '_').replace(':', '_'))
