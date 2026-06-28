@@ -1,11 +1,30 @@
-/data
+/data/bench2drive/*
+/data/chat-B2D/*
+/data/infos/*
+/data/others/*
+/data/StyleClips/
+/data/StyleClipsRemain/
+/data/StyleResults/
+
 /assets
 /Accident_Town03_Route101_Weather23
 /adzoo/orion/work_dirs
 /build
-/mmcv
-/mmcv.egg-info
 /ckpts
 INFO
 /test
 __pycache__/
+
+# Compiled Python / C extensions
+*.so
+*.o
+*.pyd
+*.pyc
+
+# Packaging artifacts
+*.egg-info/
+*.egg
+
+# Backup files
+*.bak
+*.bak_*

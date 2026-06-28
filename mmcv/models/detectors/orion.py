@@ -121,6 +121,10 @@ class Orion(MVXTwoStageDetector):
                  loss_plan_col=dict(type='PlanCollisionLoss', loss_weight=1.0),
                  loss_vae_gen=dict(type='ProbabilisticLoss', loss_weight=1.0),
                  plan_cls_loss_smooth = False,
+                 use_style_conditioning = False,  # [StyleDrive] enable style-conditioned diffusion
+                 style_inject_mode = 'add',        # [StyleDrive] 'add'=additive on time_embed (orig); 'token'=extra token into ego_query cross-attention (stronger)
+                 style_dropout = 0.0,              # [StyleDrive] prob. of zeroing style during training (enables classifier-free guidance)
+                 train_only_planner = False,       # [StyleDrive] freeze everything except the diffusion planner (fast, quality-preserving style fine-tune)
                  ):
         super(Orion, self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
@@ -253,8 +257,26 @@ class Orion(MVXTwoStageDetector):
                     self.loss_plan_col = build_loss(loss_plan_col)
                 # self.loss_plan_dir = build_loss(loss_plan_dir)
                 self.loss_vae_gen = build_loss(loss_vae_gen)
+                # [StyleDrive] VAE-branch style conditioning: inject style by ADDITION into
+                # current_states (shared upstream of CVAE prior/posterior, GRU rollout & decoder).
+                # zero-init last layer -> style=0 reproduces the original VAE (identity start).
+                self.use_style_conditioning = use_style_conditioning
+                self.style_inject_mode = style_inject_mode
+                self.style_dropout = style_dropout
+                if self.use_style_conditioning:
+                    self.style_token_proj = nn.Sequential(
+                        nn.Linear(1, 4096),
+                        nn.Mish(),
+                        nn.Linear(4096, 4096),
+                    )
+                    nn.init.zeros_(self.style_token_proj[-1].weight)
+                    nn.init.zeros_(self.style_token_proj[-1].bias)
             
             elif self.use_diff_decoder:
+                self.loss_plan_reg = build_loss(loss_plan_reg)
+                self.loss_plan_bound = build_loss(loss_plan_bound)
+                if self.use_col_loss:
+                    self.loss_plan_col = build_loss(loss_plan_col)
                 self.plan_cls_loss_smooth = plan_cls_loss_smooth
                 self.diff_loss_weight = diff_loss_weight
                 self.diff_traj_cls_loss_weight = 10.0
@@ -295,6 +317,30 @@ class Orion(MVXTwoStageDetector):
                     beta_schedule="scaled_linear",
                     prediction_type="sample",
                 )
+                # [StyleDrive] style conditioning: continuous score [-1,1] → 4096-dim embedding
+                self.use_style_conditioning = use_style_conditioning
+                self.style_inject_mode = style_inject_mode
+                self.style_dropout = style_dropout
+                if self.use_style_conditioning:
+                    if self.style_inject_mode == 'token':
+                        # 'token': style becomes an extra token concatenated to ego_query so the
+                        # trajectory queries read it via cross-attention (the dominant pathway).
+                        # zero-init the output so the style token starts at 0 (identity) and the
+                        # pretrained trajectory quality is preserved at the start of fine-tuning.
+                        self.style_token_proj = nn.Sequential(
+                            nn.Linear(1, 4096),
+                            nn.Mish(),
+                            nn.Linear(4096, 4096),
+                        )
+                        nn.init.zeros_(self.style_token_proj[-1].weight)
+                        nn.init.zeros_(self.style_token_proj[-1].bias)
+                    else:
+                        # 'add' (original): style embedding added onto time_embed
+                        self.style_proj = nn.Sequential(
+                            nn.Linear(1, 4096),
+                            nn.Mish(),
+                            nn.Linear(4096, 4096),
+                        )
             elif self.use_mlp_decoder: 
                 self.waypoint_decoder = nn.Sequential(
                     nn.Linear(4096, 4096 // 2),
@@ -314,6 +360,26 @@ class Orion(MVXTwoStageDetector):
 
         self.freeze_backbone = freeze_backbone
         self.temporal_prompt_input = temporal_prompt_input
+
+        # [StyleDrive] freeze everything except the diffusion planner. The planner reads the
+        # (frozen) LLM ego feature + map/detection outputs, so freezing them keeps the base
+        # model's behaviour/quality intact while we concentrate learning on the style->trajectory
+        # mapping. Frozen params (requires_grad=False) are skipped by DDP and the optimizer.
+        self.train_only_planner = train_only_planner
+        if train_only_planner:
+            if self.use_diff_decoder:
+                planner_prefixes = ('plan_anchor_encoder', 'time_mlp', 'diff_decoder',
+                                    'style_token_proj', 'style_proj')
+            else:  # VAE planner: distribution + GRU rollout + decoder (+ style)
+                planner_prefixes = ('present_distribution', 'future_distribution', 'predict_model',
+                                    'ego_fut_decoder', 'style_token_proj')
+            n_train, n_freeze = 0, 0
+            for name, p in self.named_parameters():
+                if name.startswith(planner_prefixes):
+                    p.requires_grad = True; n_train += p.numel()
+                else:
+                    p.requires_grad = False; n_freeze += p.numel()
+            print('[StyleDrive] train_only_planner: trainable=%.2fM frozen=%.2fM' % (n_train/1e6, n_freeze/1e6))
 
     @property
     def with_map_head(self):
@@ -358,7 +424,6 @@ class Orion(MVXTwoStageDetector):
 
         return img_feats_reshaped
 
-    @auto_fp16(apply_to=('img'), out_fp32=True)
     def extract_feat(self, img):
         """Extract features from images and points."""
         img_feats = self.extract_img_feat(img)
@@ -428,15 +493,21 @@ class Orion(MVXTwoStageDetector):
         list[list[dict]]), with the outer list indicating test time
         augmentations.
         """
-        if return_loss:
-            # return self.forward_train(**data)
-            losses = self.forward_train(**data)
-            loss, log_vars = self._parse_losses(losses)
-            outputs = dict(
-                loss=loss, log_vars=log_vars, num_samples=len(data['img_metas']))
-            return outputs
-        else:
-            return self.forward_test(**data)
+        # [StyleDrive] match the autocast dtype to the loaded precision. fp16_infer loads the
+        # LLM/backbone in fp16 (the authors' validated low-mem path); compute must also be fp16
+        # or the fp16 weights get downcast to bf16 and we lose the mantissa precision the planner
+        # needs. All other configs (bf16 baseline, diff_style) keep fp16_infer=False -> bf16.
+        _amp_dtype = torch.float16 if getattr(self, 'fp16_infer', False) else torch.bfloat16
+        with torch.cuda.amp.autocast(enabled=True, dtype=_amp_dtype):
+            if return_loss:
+                # return self.forward_train(**data)
+                losses = self.forward_train(**data)
+                loss, log_vars = self._parse_losses(losses)
+                outputs = dict(
+                    loss=loss, log_vars=log_vars, num_samples=len(data['img_metas']))
+                return outputs
+            else:
+                return self.forward_test(**data)
         
     def forward_train(self,
                       img_metas=None,
@@ -578,6 +649,17 @@ class Orion(MVXTwoStageDetector):
                     distribution_comp = {}
                     noise = None
                     self.fut_ts = 6
+                    # [StyleDrive] additive style injection into the shared ego feature so the
+                    # CVAE prior/posterior, GRU rollout and decoder are all style-conditioned.
+                    if getattr(self, 'use_style_conditioning', False):
+                        if 'driving_style' in data and data['driving_style'] is not None:
+                            style_score = data['driving_style'].to(current_states.dtype).view(B, 1)
+                        else:
+                            style_score = torch.zeros(B, 1, device=current_states.device, dtype=current_states.dtype)
+                        if self.training and self.style_dropout > 0:  # style dropout -> CFG
+                            keep = (torch.rand(B, 1, device=current_states.device) >= self.style_dropout).to(current_states.dtype)
+                            style_score = style_score * keep
+                        current_states = current_states + self.style_token_proj(style_score).unsqueeze(1)
                     if self.training:
                         future_distribution_inputs = ego_fut_trajs.reshape(B, ego_fut_trajs.shape[1], -1)
                     if self.PROBABILISTIC:
@@ -586,7 +668,7 @@ class Orion(MVXTwoStageDetector):
                         )
                         distribution_comp = {**distribution_comp, **output_distribution}
 
-                    hidden_states = ego_feature.unsqueeze(1)
+                    hidden_states = current_states  # [StyleDrive] carry style into GRU rollout init
                     states_hs, future_states_hs = \
                         self.future_states_predict(B, sample, hidden_states, current_states)
 
@@ -651,8 +733,29 @@ class Orion(MVXTwoStageDetector):
                     time_embed = self.time_mlp(timesteps)
                     time_embed = time_embed.view(bs,1,-1)
 
+                    # [StyleDrive] style conditioning (always run when enabled, so the style
+                    # module is used on every rank -> no DDP unused-param deadlock).
+                    cond_embed = time_embed
+                    dec_query = current_states
+                    if self.use_style_conditioning:
+                        if 'driving_style' in data and data['driving_style'] is not None:
+                            style_score = data['driving_style'].to(device=device, dtype=time_embed.dtype)
+                        else:
+                            style_score = torch.zeros(bs, device=device, dtype=time_embed.dtype)
+                        style_score = style_score.view(bs, 1)
+                        # style dropout -> classifier-free guidance: zero the style for a random subset
+                        if self.training and self.style_dropout > 0:
+                            keep = (torch.rand(bs, 1, device=device) >= self.style_dropout).to(style_score.dtype)
+                            style_score = style_score * keep
+                        if self.style_inject_mode == 'token':
+                            # style as an extra token appended to ego_query (cross-attention)
+                            style_token = self.style_token_proj(style_score).unsqueeze(1)  # (bs,1,4096)
+                            dec_query = torch.cat([current_states, style_token], dim=1)
+                        else:
+                            cond_embed = time_embed + self.style_proj(style_score).unsqueeze(1)
+
                     # 4. begin the stacked decoder
-                    poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, current_states, time_embed)
+                    poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, dec_query, cond_embed)
                     targets = torch.cumsum(ego_fut_trajs,dim=-2).squeeze(1)
                     trajectory_loss_dict = {}
 
@@ -738,7 +841,7 @@ class Orion(MVXTwoStageDetector):
             lane_results = self.map_head.get_bboxes(outs, img_metas)
         generated_text = []
         metric_dict = {}
-        if not (self.fp16_infer or self.fp32_infer) or self.fp16_eval :
+        if (not (self.fp16_infer or self.fp32_infer) or self.fp16_eval) and ('gt_attr_labels' in data):
             gt_attr_label = data['gt_attr_labels'][0].to('cpu')
             gt_bbox = data['gt_bboxes_3d'][0]
             fut_valid_flag = bool(data['fut_valid_flag'][0])
@@ -793,30 +896,40 @@ class Orion(MVXTwoStageDetector):
                     )
                     ego_feature = ego_feature.to(torch.float32)
                     current_states = ego_feature.unsqueeze(1)
-                    if not self.use_diff_decoder and not self.use_mlp_decoder: # VAE-based generate 
+                    if not self.use_diff_decoder and not self.use_mlp_decoder: # VAE-based generate
                         distribution_comp = {}
-                        noise = None
                         self.fut_ts = 6
-                        if self.PROBABILISTIC:
-                            # Do probabilistic computation
-                            sample, output_distribution = self.distribution_forward(
-                                current_states, None, noise
-                            )
-                            distribution_comp = {**distribution_comp, **output_distribution}
-
-                        # 2. predict future state from distribution
-                        hidden_states = ego_feature.unsqueeze(1)
-                        states_hs, future_states_hs = \
-                            self.future_states_predict(B, sample, hidden_states, current_states)
-
-                        ego_query_hs = \
-                            states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
-                        ego_fut_trajs_list = []
-                        for i in range(self.fut_ts):
-                            outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[i]).reshape(B, self.ego_fut_mode, 2)
-                            ego_fut_trajs_list.append(outputs_ego_trajs)
-
-                        ego_fut_preds = torch.stack(ego_fut_trajs_list, dim=2)
+                        # [StyleDrive] VAE inference: additive style conditioning + classifier-free
+                        # guidance. One _vae_decode = distribution_forward -> GRU rollout -> decoder.
+                        # cond & uncond share the SAME latent noise so the STYLE_GUIDANCE extrapolation
+                        # is valid. style=0 (or g=1) reproduces the base VAE behaviour.
+                        def _vae_decode(cs, shr_noise):
+                            smp, odist = self.distribution_forward(cs, None, shr_noise)
+                            s_hs, _fs = self.future_states_predict(B, smp, cs, cs)  # hidden=cs -> style-aware rollout
+                            eq = s_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
+                            preds = torch.stack(
+                                [self.ego_fut_decoder(eq[i]).reshape(B, self.ego_fut_mode, 2)
+                                 for i in range(self.fut_ts)], dim=2)
+                            return preds, odist
+                        _use_style = getattr(self, 'use_style_conditioning', False)
+                        _bs = current_states.shape[0]
+                        if _use_style:
+                            if 'driving_style' in data and data['driving_style'] is not None:
+                                style_score = data['driving_style'].to(current_states.dtype).view(_bs, 1)
+                            else:
+                                style_score = torch.zeros(_bs, 1, device=current_states.device, dtype=current_states.dtype)
+                            cs_cond = current_states + self.style_token_proj(style_score).unsqueeze(1)
+                        else:
+                            cs_cond = current_states
+                        _pm, _ = self.present_distribution(cs_cond)          # shared-noise shape
+                        shr_noise = torch.randn_like(_pm)
+                        ego_fut_preds, output_distribution = _vae_decode(cs_cond, shr_noise)
+                        distribution_comp = {**distribution_comp, **output_distribution}
+                        _g = float(os.environ.get('STYLE_GUIDANCE', '1.0'))
+                        if _use_style and _g != 1.0:
+                            cs_uncond = current_states + self.style_token_proj(torch.zeros_like(style_score)).unsqueeze(1)
+                            ego_fut_preds_u, _ = _vae_decode(cs_uncond, shr_noise)
+                            ego_fut_preds = ego_fut_preds_u + _g * (ego_fut_preds - ego_fut_preds_u)
                     elif self.use_diff_decoder:
                         step_num = 2
                         bs = ego_feature.shape[0]
@@ -829,6 +942,13 @@ class Orion(MVXTwoStageDetector):
                         # 1. add truncated noise to the plan anchor
                         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
                         img = self.norm_odo(plan_anchor)
+                        # [StyleDrive] deterministic closed-loop: if STYLE_SEED is set, fix the
+                        # diffusion noise so each step's trajectory is a deterministic function of
+                        # the inputs (removes per-step jitter that destabilises PID steering) and
+                        # makes style A/B paired (same noise for -1/0/+1). Unset -> original random.
+                        _seed = os.environ.get('STYLE_SEED', None)
+                        if _seed is not None:
+                            torch.manual_seed(int(_seed)); torch.cuda.manual_seed_all(int(_seed))
                         noise = torch.randn(img.shape, device=device)
                         trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
                         img = self.diffusion_scheduler.add_noise(original_samples=img, noise=noise, timesteps=trunc_timesteps)
@@ -856,10 +976,36 @@ class Orion(MVXTwoStageDetector):
                             time_embed = self.time_mlp(timesteps)
                             time_embed = time_embed.view(bs,1,-1)
 
-                            # 4. begin the stacked decoder
-                            poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, current_states, time_embed)
-                            poses_reg = poses_reg_list[-1]
-                            poses_cls = poses_cls_list[-1]
+                            # [StyleDrive] style conditioning at inference (+ optional
+                            # classifier-free guidance). STYLE_GUIDANCE env (default 1.0).
+                            # 'add' mode injects on time_embed; 'token' mode appends a style
+                            # token to ego_query. With g!=1: poses_reg = uncond + g*(cond-uncond).
+                            _guidance = float(os.environ.get('STYLE_GUIDANCE', '1.0'))
+                            if self.use_style_conditioning:
+                                if 'driving_style' in data and data['driving_style'] is not None:
+                                    style_score = data['driving_style'].to(device=device, dtype=time_embed.dtype).view(bs, 1)
+                                else:
+                                    style_score = torch.zeros(bs, 1, device=device, dtype=time_embed.dtype)
+                                zero_score = torch.zeros(bs, 1, device=device, dtype=time_embed.dtype)
+                                if self.style_inject_mode == 'token':
+                                    ce_c = time_embed; dq_c = torch.cat([current_states, self.style_token_proj(style_score).unsqueeze(1)], dim=1)
+                                    ce_u = time_embed; dq_u = torch.cat([current_states, self.style_token_proj(zero_score).unsqueeze(1)], dim=1)
+                                else:
+                                    ce_c = time_embed + self.style_proj(style_score).unsqueeze(1); dq_c = current_states
+                                    ce_u = time_embed + self.style_proj(zero_score).unsqueeze(1); dq_u = current_states
+                                if _guidance != 1.0:
+                                    reg_c, cls_c = self.diff_decoder(traj_feature, noisy_traj_points, dq_c, ce_c)
+                                    reg_u, _cls_u = self.diff_decoder(traj_feature, noisy_traj_points, dq_u, ce_u)
+                                    poses_reg = reg_u[-1] + _guidance * (reg_c[-1] - reg_u[-1])
+                                    poses_cls = cls_c[-1]
+                                else:
+                                    poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, dq_c, ce_c)
+                                    poses_reg = poses_reg_list[-1]
+                                    poses_cls = poses_cls_list[-1]
+                            else:
+                                poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, current_states, time_embed)
+                                poses_reg = poses_reg_list[-1]
+                                poses_cls = poses_cls_list[-1]
                             x_start = poses_reg[...,:2]
                             x_start = self.norm_odo(x_start)
                             img = self.diffusion_scheduler.step(
@@ -932,7 +1078,7 @@ class Orion(MVXTwoStageDetector):
                     ego_fut_pred = ego_fut_preds.cumsum(dim=-2) 
                 else:
                     ego_fut_pred = ego_fut_preds
-                if not (self.fp16_infer or self.fp32_infer) or self.fp16_eval:
+                if (not (self.fp16_infer or self.fp32_infer) or self.fp16_eval) and ('ego_fut_trajs' in data):
                     ego_fut_trajs = data['ego_fut_trajs'][0, 0]
                     ego_fut_trajs = ego_fut_trajs.cumsum(dim=-2)
                     metric_dict_planner_stp3 = self.compute_planner_metric_stp3(

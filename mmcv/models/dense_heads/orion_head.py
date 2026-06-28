@@ -1028,10 +1028,10 @@ class OrionHead(AnchorFreeHead):
         label_weights = gt_bboxes.new_ones(num_bboxes)
         label_traffic_state = gt_bboxes.new_zeros(num_bboxes,2).to(torch.long)
         label_traffic_mask =  gt_bboxes.new_zeros(num_bboxes).to(torch.bool)
-        # bbox targets
+        # bbox targets (use float32 for index_put compat with gt data)
         code_size = gt_bboxes.size(1)
-        bbox_targets = torch.zeros_like(bbox_pred)[..., :code_size]
-        bbox_weights = torch.zeros_like(bbox_pred)
+        bbox_targets = torch.zeros(bbox_pred.shape[:-1] + (code_size,), dtype=torch.float32, device=bbox_pred.device)
+        bbox_weights = torch.zeros(bbox_pred.shape, dtype=torch.float32, device=bbox_pred.device)
         # print(gt_bboxes.size(), bbox_pred.size())
         if self.use_col_loss:
             # trajs targets

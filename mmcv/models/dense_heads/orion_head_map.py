@@ -690,9 +690,9 @@ class OrionHeadM(AnchorFreeHead):
                                     dtype=torch.long)
         label_weights = gt_bboxes.new_ones(num_preds)
 
-        # bbox targets
-        bbox_targets = torch.zeros_like(bbox_pred)
-        bbox_weights = torch.zeros_like(bbox_pred)
+        # bbox targets (use float32 for index_put compat with gt data)
+        bbox_targets = torch.zeros(bbox_pred.shape, dtype=torch.float32, device=bbox_pred.device)
+        bbox_weights = torch.zeros(bbox_pred.shape, dtype=torch.float32, device=bbox_pred.device)
         
         if sampling_result.num_gts > 0:
             labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
